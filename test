@@ -1,0 +1,108 @@
+package com.rsk.csp.ds.listener.org.service;
+
+import com.rsk.csp.ds.listener.org.config.DBTConfig;
+import com.rsk.csp.ds.listener.org.data.dbt.DBTModelName;
+import com.rsk.csp.ds.listener.org.data.model.ModelExecutionResult;
+import com.rsk.csp.ds.listener.org.data.model.ModelExecutionStatus;
+import com.rsk.csp.ds.listener.org.data.model.ModelInfo;
+import com.rsk.csp.ds.listener.org.dbt.DBTCommand;
+import com.rsk.csp.ds.listener.org.dbt.DBTCommandBuilder;
+import com.rsk.csp.ds.listener.org.dbt.DBTExecutor;
+import com.rsk.csp.ds.listener.org.message.ModelContext;
+import com.rsk.csp.ds.listener.org.message.ModelOutputResult;
+import com.rsk.csp.ds.listener.org.utils.ListenerUtil;
+import io.github.resilience4j.retry.annotation.Retry;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.List;
+import java.util.concurrent.Executor;
+import java.util.stream.Collectors;
+
+@Service
+public class ModelExecutionServiceImpl {
+
+    @Autowired
+    public ListenerUtil listenerUtil;
+
+    private final DBTConfig dbtConfig;
+
+    private static final Log LOGGER = LogFactory.getLog(ModelExecutionServiceImpl.class);
+    private final ModelInfoServiceImpl modelInfoService;
+
+    private final SimpleDateFormat simpleDateFormat = new SimpleDateFormat("dd-MM-yyyy");
+
+    private final Executor modelExecutor;
+
+
+    public ModelExecutionServiceImpl(ModelInfoServiceImpl modelInfoService, DBTConfig dbtConfig, Executor modelExecutor) {
+        this.modelInfoService = modelInfoService;
+        this.dbtConfig = dbtConfig;
+        this.modelExecutor = modelExecutor;
+    }
+
+    @Retry(name = "modelSequence")
+    public ModelOutputResult executeModelsSequence(ModelContext modelContext) {
+        if (modelContext == null || modelContext.getModelSequence() == null || modelContext.getModelStage() == null) {
+            throw new RuntimeException("Model Name can not be null");
+        }
+        List<ModelInfo> modelSequence = modelInfoService.getModelSequenceFor(modelContext);
+
+        ModelOutputResult modelOutputResult = ModelOutputResult.of(modelContext);
+        modelOutputResult.setExecutionResults(modelSequence.stream().map(this::executeModel).collect(Collectors.toList()));
+        return modelOutputResult;
+    }
+
+
+    ModelExecutionResult executeModel(ModelInfo modelInfo) {
+        DBTCommand dbtCommand = prepareDBTCommand(modelInfo.getModel(), modelInfo);
+        ModelExecutionResult modelExecutionResult;
+        try {
+            if (modelInfo.getLastExecuteDate() == null ||
+                    !simpleDateFormat.format(new Date()).equals(simpleDateFormat.format(modelInfo.getLastExecuteDate()))) {
+                LOGGER.info("Executing model(s)");
+                modelExecutionResult = executeCommand(dbtCommand);
+                updateExecutionTime(modelInfo);
+            } else {
+                modelExecutionResult = new ModelExecutionResult();
+                modelExecutionResult.setStatus(ModelExecutionStatus.SKIPPED);
+                modelExecutionResult.setProcessLogs("Skipping execution as models last execution date was today: " + modelInfo.getLastExecuteDate());
+                LOGGER.info(modelExecutionResult.getProcessLogs());
+
+            }
+        } catch (IOException e) {
+            modelExecutionResult = new ModelExecutionResult();
+            modelExecutionResult.setStatus(ModelExecutionStatus.FAILED);
+            modelExecutionResult.setError(e.getMessage());
+        }
+
+        return modelExecutionResult;
+    }
+
+
+    public List<ModelExecutionResult> executeModelsSequence(ModelContext modelContext, RuntimeException runtimeException) {
+        return null;
+    }
+
+
+    private DBTCommand prepareDBTCommand(DBTModelName dbtModelName, ModelInfo modelInfo) {
+        LOGGER.info("preparing dbt command for model: " + dbtModelName.getModelName());
+        String command = DBTCommandBuilder.getInstance().setDbtConfig(dbtConfig).setModelStage(modelInfo.getModelStage()).setModelName(dbtModelName).build();
+        return new DBTCommand(command);
+    }
+
+    private ModelExecutionResult executeCommand(DBTCommand dbtCommand) throws IOException {
+        return DBTExecutor.execute(dbtCommand.getCommand());
+    }
+
+    private void updateExecutionTime(ModelInfo modelInfo) {
+        modelInfo.setLastExecuteDate(new Date(System.currentTimeMillis()));
+        modelInfoService.save(modelInfo);
+    }
+}
